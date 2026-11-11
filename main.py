@@ -236,13 +236,18 @@ def briefing(view):
             for r in view["seerResults"]
         )
         lines.append("Your true inspection results: " + res + ".")
-    if you["role"] == "werewolf" and view.get("wolfVotes"):
-        tonight = [v for v in view["wolfVotes"] if v["night"] == view["day"] and v["seat"] != you["seat"]]
+    if you["role"] == "werewolf" and view["phase"] == "night":
+        tonight = [v for v in view.get("wolfVotes") or [] if v["night"] == view["day"] and v["seat"] != you["seat"]]
         for v in tonight:
             lines.append(
                 f"Tonight your partner {who(view, v['seat'])} named {who(view, v['target'])} as the victim."
                 if v["target"] is not None
                 else f"Tonight your partner {who(view, v['seat'])} named nobody yet."
+            )
+        if not tonight:
+            lines.append(
+                "Your partner has not named a victim yet tonight: you may be naming first, so pick the victim "
+                "a partner would most likely also name (the obvious threat to the wolves), or your partner will confirm yours."
             )
     scores, _ = suspicion(view)
     ranked = sorted((s for s in scores if s != you["seat"]), key=lambda s: (-scores[s], s))
@@ -272,7 +277,10 @@ def render(view, pending):
     lines.extend(briefing(view))
     lines.append("")
     lines.append("The game's public record, in order:")
-    lines.extend(log_lines(view))
+    record = log_lines(view)
+    if len(record) > 90:
+        record = record[:6] + [f"[moderator] … {len(record) - 72} earlier entries omitted; the last 66 follow."] + record[-66:]
+    lines.extend(record)
     lines.append("")
     lines.append(PLAYBOOKS[you["role"]])
     lines.append("")
@@ -465,7 +473,7 @@ def heuristic(pending, trial_seed):
         for v in view.get("wolfVotes") or []:
             if v["night"] == view["day"] and v["seat"] == partner.get("seat") and v["target"] in options:
                 return {"game": pending["game"], "decision": kind, "target": v["target"]}
-        claimants = [s for s in claims if s in options]
+        claimants = sorted(s for s in claims if s in options)
         if claimants:
             return {"game": pending["game"], "decision": kind, "target": rng.choice(claimants)}
         target = best_by(options, lambda s: speeches.get(s, 0), rng)
@@ -478,7 +486,7 @@ def heuristic(pending, trial_seed):
         return {"game": pending["game"], "decision": kind, "target": target}
 
     if kind == "protect":
-        claimants = [s for s in claims if s in options]
+        claimants = sorted(s for s in claims if s in options)
         if claimants:
             return {"game": pending["game"], "decision": kind, "target": rng.choice(claimants)}
         target = best_by(options, lambda s: speeches.get(s, 0), rng)
@@ -504,7 +512,7 @@ def vote_choice(view, options, claims, scores, rng):
         for seat, c in claims.items():
             if seat != partner_seat:
                 named |= c["wolves"]
-        live_named = [s for s in named if s in options]
+        live_named = sorted(s for s in named if s in options)
         if len(claims) == 1 and live_named:
             return live_named[0]
     if wagon:
