@@ -9,7 +9,10 @@ answers one JSON object. A model that cannot be reached, refuses, or answers
 unreadably falls back to a deterministic heuristic for that decision, so no
 game ever stalls: the kill follows the partner wolf's pick, the seer claims
 a found wolf, the doctor guards the claimed seer, votes join the village's
-best wagon.
+best wagon. The heuristics are a complete player in their own right — a
+fact engine over the public record (proven liars whose "werewolf" turned
+out to be a villager, votes for and against revealed roles, wagon state)
+drives every decision kind and every statement they make.
 
 Deterministic given the model's replies: no clock is read into anything sent,
 randomness comes only from the vendored SDK's seeded RNG (MAKEFUN_TRIAL_SEED
@@ -202,7 +205,11 @@ def suspicion(view):
     for seat in alive:
         s = 0
         for (day, voter), target in votes.items():
-            if voter == seat and target in revealed and revealed[target] != "werewolf":
+            if voter != seat or target not in revealed:
+                continue
+            if revealed[target] == "werewolf":
+                s -= 2  # voted to exile someone who proved to be a werewolf: trusted
+            else:
                 s += 2  # voted to exile someone who proved to be village
         if view["day"] >= 3 and speeches.get(seat, 0) == 0:
             s += 1  # silent deep into the game
@@ -473,10 +480,19 @@ def heuristic(pending, trial_seed):
         for v in view.get("wolfVotes") or []:
             if v["night"] == view["day"] and v["seat"] == partner.get("seat") and v["target"] in options:
                 return {"game": pending["game"], "decision": kind, "target": v["target"]}
-        claimants = sorted(s for s in claims if s in options)
-        if claimants:
-            return {"game": pending["game"], "decision": kind, "target": rng.choice(claimants)}
-        target = best_by(options, lambda s: speeches.get(s, 0), rng)
+        doctor_dead = any(p["role"] == "doctor" and not p["alive"] for p in view["players"])
+        claimants = {s for s in claims if s in options}
+
+        def kill_value(s):
+            # The dangerous villager is trusted and active. A claimed seer is
+            # the top target only once the doctor can no longer guard them;
+            # while the doctor may live, the claim is probably protected.
+            value = speeches.get(s, 0) * 2 - scores.get(s, 0) * 3
+            if s in claimants:
+                value += 6 if doctor_dead else -6
+            return value
+
+        target = best_by(options, kill_value, rng)
         return {"game": pending["game"], "decision": kind, "target": target}
 
     if kind == "inspect":
@@ -489,7 +505,8 @@ def heuristic(pending, trial_seed):
         claimants = sorted(s for s in claims if s in options)
         if claimants:
             return {"game": pending["game"], "decision": kind, "target": rng.choice(claimants)}
-        target = best_by(options, lambda s: speeches.get(s, 0), rng)
+        # Guard whom the wolves most want dead: a trusted, active villager.
+        target = best_by(options, lambda s: speeches.get(s, 0) - scores.get(s, 0) * 2, rng)
         return {"game": pending["game"], "decision": kind, "target": target}
 
     if kind == "vote":
@@ -497,6 +514,16 @@ def heuristic(pending, trial_seed):
         return {"game": pending["game"], "decision": kind, "target": target}
 
     return fallback_for(pending)
+
+
+def proven_liars(view, claims):
+    """Claimants who named as a werewolf a seat since revealed as village."""
+    _, revealed = vote_history(view)
+    liars = set()
+    for seat, c in claims.items():
+        if any(revealed.get(t) not in (None, "werewolf") for t in c["wolves"]):
+            liars.add(seat)
+    return liars
 
 
 def vote_choice(view, options, claims, scores, rng):
@@ -508,6 +535,19 @@ def vote_choice(view, options, claims, scores, rng):
             if r["werewolf"] and r["seat"] in options:
                 return r["seat"]
     if you["role"] != "werewolf":
+        liars = proven_liars(view, claims)
+        live_liars = sorted(s for s in liars if s in options)
+        if live_liars:
+            return live_liars[0]
+        for seat, c in claims.items():
+            if you["seat"] in c["wolves"] and seat in options:
+                return seat  # a "seer" who calls me a wolf is lying: I am village
+        if you["role"] != "seer":
+            rivals = [s for s in claims if s in options]
+            if len(claims) >= 2 and rivals:
+                # Rival seer claims: one claimant is a wolf. Test the claimant
+                # whose own record fits a wolf's better.
+                return best_by(rivals, lambda s: scores.get(s, 0), rng)
         named = set()
         for seat, c in claims.items():
             if seat != partner_seat:
@@ -526,12 +566,23 @@ def vote_choice(view, options, claims, scores, rng):
     return best_by(pool, lambda s: scores.get(s, 0), rng)
 
 
+def bad_votes(view):
+    """{voter: [(day, target)]} for votes that exiled a proven villager."""
+    votes, revealed = vote_history(view)
+    out = {}
+    for (day, voter), target in votes.items():
+        if target in revealed and revealed[target] != "werewolf":
+            out.setdefault(voter, []).append((day, target))
+    return out
+
+
 def heuristic_speak(pending, rng):
     view = pending["view"]
     you = view["you"]
-    options_alive = [p["seat"] for p in view["players"] if p["alive"] and p["seat"] != you["seat"]]
+    alive_others = [p["seat"] for p in view["players"] if p["alive"] and p["seat"] != you["seat"]]
     claims = claims_heard(view)
     scores, _ = suspicion(view)
+    liar_seats = proven_liars(view, claims) if you["role"] != "werewolf" else set()
 
     def say(text):
         folded = fold_statement(text)
@@ -540,35 +591,101 @@ def heuristic_speak(pending, rng):
             folded = folded[:limit].rstrip()
         return {"game": pending["game"], "decision": "speak", "text": folded}
 
+    def pick(variants):
+        return rng.choice(variants) if len(variants) > 1 else variants[0]
+
     if you["role"] == "seer":
         results = view.get("seerResults") or []
         wolves = [r for r in results if r["werewolf"]]
+        rivals = [s for s in claims if s != you["seat"]]
+        if rivals and results:
+            parts = "; ".join(
+                f"{who(view, r['seat'])} {'is a werewolf' if r['werewolf'] else 'is clear'}" for r in results
+            )
+            return say(
+                f"I am the real seer, and {who(view, rivals[0])} is lying. My checks: {parts}. "
+                "A false claim comes from a wolf; judge us by these results."
+            )
         if wolves and view["day"] >= 2:
             r = wolves[-1]
             return say(
-                f"I am the seer. Last night I checked {who(view, r['seat'])}: they are a werewolf. "
-                f"Vote {who(view, r['seat'])} out today and we are halfway there."
+                pick(
+                    [
+                        f"I am the seer. Last night I checked {who(view, r['seat'])}: they are a werewolf. "
+                        f"Vote {who(view, r['seat'])} out today and we are halfway there.",
+                        f"Claiming now because I found one: I am the seer, and {who(view, r['seat'])} is a werewolf. "
+                        f"That is tonight's fact; let us exile them today.",
+                    ]
+                )
             )
         if len(results) >= 2 and view["day"] >= 4:
             parts = "; ".join(
                 f"{who(view, r['seat'])} {'is a werewolf' if r['werewolf'] else 'is clear'}" for r in results
             )
             return say(f"I am the seer, claiming now so my results are not lost: {parts}. Let us vote on the evidence.")
-    if you["role"] != "werewolf" and len(claims) == 1:
-        claimant, c = next(iter(claims.items()))
-        if c["wolves"]:
-            target = sorted(c["wolves"])[0]
+
+    if liar_seats:
+        liar = sorted(liar_seats)[0]
+        named = sorted(claims[liar]["wolves"] & set(vote_history(view)[1]))[:1]
+        victim = named[0] if named else sorted(claims[liar]["wolves"])[0]
+        return say(
+            f"{who(view, liar)} claimed seer and named {who(view, victim)} a werewolf, but {who(view, victim)} "
+            f"died a villager. That claim was a lie, and lies come from wolves: {who(view, liar)} has my vote."
+        )
+
+    if you["role"] != "werewolf":
+        for seat, c in claims.items():
+            if you["seat"] in c["wolves"]:
+                return say(
+                    f"{who(view, seat)} names me a werewolf, but I know my own role: I am village. "
+                    "A real seer would have seen that, so that claim is false. Do not follow it."
+                )
+        if len(claims) == 1:
+            claimant, c = next(iter(claims.items()))
+            if c["wolves"]:
+                target = sorted(c["wolves"])[0]
+                return say(
+                    f"{who(view, claimant)} claims seer and names {who(view, target)} as a wolf. "
+                    "Nobody has counter-claimed, so I will back that vote today."
+                )
+        if len(claims) >= 2:
             return say(
-                f"{who(view, claimant)} claims seer and names {who(view, target)} as a wolf. "
-                "Nobody has counter-claimed, so I will back that vote today."
+                "Two seer claims cannot both be true, so one claimant is a wolf hiding behind the role. "
+                "Compare their named results with the deaths we know, and let us test the claim that fits worse."
             )
-    pool = [s for s in options_alive if s != (you.get("partner") or {}).get("seat")]
+
+    pool = [s for s in alive_others if s != (you.get("partner") or {}).get("seat")]
     if pool:
         suspect = best_by(pool, lambda s: scores.get(s, 0), rng)
+        mine_today = sum(1 for e in view["log"] if e["kind"] == "speech" and e["seat"] == you["seat"] and e["day"] == view["day"])
+        if mine_today >= 1 and scores.get(suspect, 0) > 0:
+            return say(
+                f"To keep the village together: my vote goes to {who(view, suspect)} unless stronger evidence appears. "
+                "A split vote exiles nobody and only helps the wolves."
+            )
+        bad = bad_votes(view).get(suspect)
+        if bad:
+            day, target = bad[-1]
+            return say(
+                pick(
+                    [
+                        f"Look at the record: on day {day}, {who(view, suspect)} voted to exile {who(view, target)}, "
+                        f"who proved to be a villager. That is the strongest fact I have; {who(view, suspect)} is my main suspect.",
+                        f"Facts first: {who(view, suspect)} helped exile {who(view, target)} on day {day}, and "
+                        f"{who(view, target)} was village. I want {who(view, suspect)}'s defence before I vote anywhere else.",
+                    ]
+                )
+            )
         if scores.get(suspect, 0) > 0:
             return say(
                 f"Look at the record: {who(view, suspect)} has voted with the wolves' interests so far. "
                 f"They are my main suspect today; I want to hear their defence."
+            )
+        alive_count = len(alive_others) + 1
+        if you["role"] != "werewolf" and alive_count <= 5:
+            return say(
+                f"Count with me: {alive_count} of us are left and both wolves may still be alive. "
+                "We cannot afford a scattered vote today; build one case and stand behind it together."
             )
         return say(
             f"No hard evidence yet. I am watching {who(view, suspect)} closely; quiet seats help only the wolves, so everyone should talk today."
